@@ -1,3 +1,4 @@
 scheduler
 *.dSYM
 .ccls-cache
+.idea/
