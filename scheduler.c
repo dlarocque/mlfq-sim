@@ -11,16 +11,6 @@
 
 enum cpu_task_type { short_task, medium_task, long_task, io_task };
 
-typedef struct Task {
-    char *task_name;
-    enum cpu_task_type task_type;
-    unsigned int task_length;
-    unsigned int odds_of_io;
-    unsigned int priority;
-    unsigned int time_remaining;
-    TAILQ_ENTRY(Task) stailq;
-} task;
-
 #define MLFQ_TOP_PRIORITY 3
 #define QUANTUM_LEN 50
 #define MAX_TIME_ALLOTMENT 200
@@ -29,6 +19,20 @@ struct MLFQ {
     TAILQ_HEAD(task_queue, Task) levels[MLFQ_TOP_PRIORITY];
 };
 
+typedef struct Task {
+    char *task_name;
+    enum cpu_task_type task_type;
+    int task_length;
+    int odds_of_io;
+    int priority;
+    int time_remaining;
+    struct timespec arrival_time;
+    struct timespec first_cpu_time;
+    struct timespec completion_time;
+    bool ran_before;
+    TAILQ_ENTRY(Task) stailq;
+} task;
+
 static void microsleep(unsigned int);
 void mlfq_init(int);
 void mlfq_insert_task(task *);
@@ -36,12 +40,15 @@ bool mlfq_done();
 void *reader(void *);
 void *scheduler(void *);
 void *worker(void *);
+struct timespec diff(struct timespec start, struct timespec end);
+void report_statistics();
 
 int num_cpus;
 char *filename;
 struct MLFQ *mlfq;
 bool reading_started = false;
 bool reading_done = false;
+task *active_task[1]; // the task that each CPU is working on
 pthread_mutex_t task_available_mutex;
 pthread_mutex_t mlfq_mutex;
 pthread_cond_t task_available_cond;
@@ -73,6 +80,8 @@ int main(int argc, char **argv) {
     pthread_join(worker_thread, NULL);
     pthread_join(scheduler_thread, NULL);
 
+    report_statistics();
+
     printf("mlfq exiting cleanly\n");
 }
 
@@ -95,6 +104,7 @@ void mlfq_init(int s) {
 void mlfq_insert_task(task *new_task) {
     pthread_mutex_unlock(&mlfq_mutex);
     assert(new_task != NULL);
+    assert(new_task->time_remaining > 0);
     printf("mlfq_insert_task: task %s inserted at %d\n", new_task->task_name, new_task->priority);
     TAILQ_INSERT_TAIL(&mlfq->levels[new_task->priority], new_task, stailq);
     pthread_mutex_unlock(&mlfq_mutex);
@@ -118,6 +128,14 @@ bool mlfq_done() {
         for (int level = MLFQ_TOP_PRIORITY-1; level >= 0; --level) {
             if (!TAILQ_EMPTY(&mlfq->levels[level])) {
                 // printf("mlfq_done: level was non-empty\n");
+                done = false;
+                break;
+            }
+        }
+
+        // check if there are any currently active CPUs
+        for (int i = 0; i < 1; i++) {
+            if (active_task[i] != NULL) {
                 done = false;
                 break;
             }
@@ -167,10 +185,11 @@ void *reader(void *args) {
             new_task->priority = MLFQ_TOP_PRIORITY-1;
             new_task->odds_of_io = odds_of_io;
             mlfq_insert_task(new_task);
+            clock_gettime(CLOCK_REALTIME, &new_task->arrival_time);
         }
     }
 
-    printf("reader: exiting");
+    printf("reader: exiting\n");
     reading_done = true;
     return NULL;
 }
@@ -180,7 +199,7 @@ void *scheduler(void *args) {
 
     // temp
     while (!reading_started) {
-        printf("spin");
+        // printf("spin");
         ;
     }
 
@@ -232,61 +251,82 @@ void *scheduler(void *args) {
 
 void *worker(void *args) {
     (void)args;
-    task *current_task;
 
     while (!mlfq_done()) {
         pthread_mutex_lock(&task_available_mutex);
-        printf("worker waiting for a task\n");
+        printf("worker: waiting for a task\n");
         while (available_task == NULL) {
             pthread_cond_wait(&task_available_cond, &task_available_mutex);
         }
 
-        current_task = available_task;
-        available_task = NULL;
+        active_task[0] = available_task;
+        available_task = NULL; // we've taken responsibility for this task, no other worker can now take it
         pthread_cond_signal(&task_available_cond);
         pthread_mutex_unlock(&task_available_mutex);
 
-        printf("worker: working on task:\n\ttask name: %s\n\ttime remaining: %d\n\tpriority: %d\n", current_task->task_name, current_task->time_remaining, current_task->priority);
+        // first time running a task, collect statistics
+        if (!active_task[0]->ran_before) {
+            active_task[0]->ran_before = true;
+            clock_gettime(CLOCK_REALTIME, &active_task[0]->first_cpu_time);
+        }
 
-        unsigned int sleep_time = 0;
-        if (current_task->task_type == io_task) {
-            unsigned int rand_io = rand() % 100;
-            if (current_task->odds_of_io < rand_io) {
+        assert(active_task[0]->time_remaining > 0);
+        printf("worker: working on task:\n\ttask name: %s\n\ttime remaining: %u\n\tpriority: %d\n", active_task[0]->task_name, active_task[0]->time_remaining, active_task[0]->priority);
+
+        int sleep_time = 0;
+        if (active_task[0]->task_type == io_task) {
+            int rand_io = rand() % 100;
+            if (active_task[0]->odds_of_io < rand_io) {
                 sleep_time = rand() % QUANTUM_LEN;
+                if (sleep_time > active_task[0]->time_remaining) {
+                    sleep_time = active_task[0]->time_remaining;
+                }
+            } else {
+                sleep_time = QUANTUM_LEN;
             }
         } else {
             // sleep until task is done or time quantum is complete
-            if (current_task->time_remaining > QUANTUM_LEN) {
+            if (active_task[0]->time_remaining > QUANTUM_LEN) {
                 sleep_time = QUANTUM_LEN;
             } else {
-                sleep_time = current_task->time_remaining;
+                sleep_time = active_task[0]->time_remaining;
             }
         }
 
         printf("worker: sleeping for %u microseconds\n", sleep_time);
         microsleep(sleep_time);
+        printf("worker: done task");
 
-        current_task->time_remaining -= sleep_time; 
+        int prev_time_remaining = active_task[0]->time_remaining;
+        assert(sleep_time >= 0);
+        active_task[0]->time_remaining = active_task[0]->time_remaining - sleep_time; 
+        assert(prev_time_remaining >= active_task[0]->time_remaining);
 
         // drop priority if entire quantum is used
-        if (sleep_time == QUANTUM_LEN && current_task->priority > 0) {
-            printf("worker: task %s is dropping priority\n", current_task->task_name);
-            current_task->priority--;
+        if (sleep_time == QUANTUM_LEN && active_task[0]->priority > 0) {
+            printf("worker: task %s is dropping priority\n", active_task[0]->task_name);
+            active_task[0]->priority--;
         }
 
         // put the task back in the scheduler if it's not yet complete
-        if (current_task->time_remaining > 0) {
-            printf("worker: task %s is going back to scheduler\n", current_task->task_name);
-            mlfq_insert_task(current_task);
+        if (active_task[0]->time_remaining > 0) {
+            printf("worker: task %s is going back to scheduler\n", active_task[0]->task_name);
+            mlfq_insert_task(active_task[0]);
         } else {
             // task is done
-            printf("worker: task %s is done\n", current_task->task_name);
+            clock_gettime(CLOCK_REALTIME, &active_task[0]->completion_time);
+            printf("worker: task %s is done\n", active_task[0]->task_name);
         }
 
+        active_task[0] = NULL;
     }
 
     printf("worker: exiting\n");
     return NULL;
+}
+
+void report_statistics() {
+    double average_turnaround_time, average_response_time;
 }
 
 #define NANOS_PER_USEC 1000
@@ -300,3 +340,15 @@ static void microsleep(unsigned int usecs) {
         ret = nanosleep(&t, &t);
     } while (ret == -1 && (t.tv_sec || t.tv_nsec));
 } 
+
+struct timespec diff(struct timespec start, struct timespec end) {
+	struct timespec temp;
+	if ((end.tv_nsec-start.tv_nsec)<0) {
+		temp.tv_sec = end.tv_sec-start.tv_sec-1;
+		temp.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec-start.tv_sec;
+		temp.tv_nsec = end.tv_nsec-start.tv_nsec;
+	}
+	return temp;
+}
