@@ -17,17 +17,6 @@ enum cpu_task_type {
     NUM_TASK_TYPES
 };
 
-#define MLFQ_TOP_PRIORITY 3
-#define QUANTUM_LEN 50
-#define MAX_TIME_ALLOTMENT 200
-struct MLFQ {
-    unsigned int s;
-    struct timespec last_reset_time;
-    TAILQ_HEAD(task_queue, Task) levels[MLFQ_TOP_PRIORITY];
-    TAILQ_HEAD(active_queue, Task) active;
-    TAILQ_HEAD(done_queue, Task) done; // completed tasks
-};
-
 typedef struct Task {
     char *task_name;
     enum cpu_task_type task_type;
@@ -39,8 +28,23 @@ typedef struct Task {
     struct timespec first_cpu_time;
     struct timespec completion_time;
     bool ran_before;
-    TAILQ_ENTRY(Task) tailq;
 } task;
+
+#define MLFQ_TOP_PRIORITY 3
+#define QUANTUM_LEN 50
+#define MAX_TIME_ALLOTMENT 200
+#define MAX_TASKS 100
+#define MAX_CPUS 100
+struct MLFQ {
+    unsigned int s;
+    struct timespec last_reset_time;
+    task *levels[MLFQ_TOP_PRIORITY][MAX_TASKS];
+    task *active[MAX_TASKS];
+    task *done[MAX_TASKS];
+    int num_tasks[MLFQ_TOP_PRIORITY];
+    int num_active;
+    int num_done;
+};
 
 static void microsleep(unsigned int);
 
@@ -50,19 +54,19 @@ void mlfq_introduce(task *);
 
 void mlfq_insert(task *);
 
-task *mlfq_next();
+void append_task(task *[MAX_TASKS], task *, int *, pthread_mutex_t *);
 
-void mlfq_remove(task *);
+void remove_task(task *, task *[MAX_TASKS], int *, pthread_mutex_t *);
+
+task *pop_task(task *task_arr[MAX_TASKS], int *num_tasks, pthread_mutex_t *mutex);
 
 task *mlfq_pop();
 
-void mlfq_done(task *done_task);
+void mlfq_done(task *);
 
 bool mlfq_is_done();
 
 void mlfq_reset_queues();
-
-void mlfq_insert_at(task *t, int priority);
 
 void *reader(void *);
 
@@ -84,7 +88,7 @@ int num_cpus;
 char *filename;
 struct MLFQ *mlfq;
 bool reading_done = false;
-task *active_task[1]; // the task that each CPU is working on
+task *active_task[MAX_CPUS]; // the task that each CPU is working on
 pthread_mutex_t available_task_mutex;
 pthread_mutex_t mlfq_levels_mutex;
 pthread_mutex_t mlfq_active_mutex;
@@ -131,29 +135,25 @@ void mlfq_init(int s) {
     pthread_mutex_lock(&mlfq_levels_mutex);
     mlfq = malloc(sizeof(struct MLFQ));
     mlfq->s = s;
-
-    // Initialize tail queues
-    for (int i = 0; i < MLFQ_TOP_PRIORITY; i++) {
-        TAILQ_INIT(&mlfq->levels[i]);
+    mlfq->num_active = 0;
+    mlfq->num_done = 0;
+    for (int level = 0; level < MLFQ_TOP_PRIORITY; level++) {
+        mlfq->num_tasks[level] = 0;
     }
 
-    TAILQ_INIT(&mlfq->done);
-    TAILQ_INIT(&mlfq->active);
     clock_gettime(CLOCK_REALTIME, &mlfq->last_reset_time);
-
     pthread_mutex_unlock(&mlfq_levels_mutex);
 }
 
 /**
- * Introduces a new task to the MLFQ by adding it to the list of active tasks,
+ * Introduces a new task to the MLFQ by adding it to the array of active tasks,
  * and inserting it into the MLFQ.
  */
 void mlfq_introduce(task *t) {
     verify_task(t);
     pthread_mutex_lock(&mlfq_active_mutex);
-    TAILQ_INSERT_TAIL(&mlfq->active, t, tailq);
+    mlfq->active[mlfq->num_active++] = t;
     pthread_mutex_unlock(&mlfq_active_mutex);
-
     printf("READER: Introduced task %s\n", t->task_name);
 
     mlfq_insert(t);
@@ -165,72 +165,84 @@ void mlfq_introduce(task *t) {
 void mlfq_insert(task *t) {
     pthread_mutex_lock(&mlfq_levels_mutex);
     verify_task(t);
-    TAILQ_INSERT_TAIL(&mlfq->levels[t->priority], t, tailq);
+    mlfq->levels[t->priority][mlfq->num_tasks[t->priority]++] = t;
     pthread_mutex_unlock(&mlfq_levels_mutex);
 }
 
-void mlfq_done(task *t) {
-    assert(t != NULL);
-    assert(t->time_remaining == 0);
+void remove_task(task *t, task *task_arr[MAX_TASKS], int *num_tasks, pthread_mutex_t *mutex) {
+    pthread_mutex_lock(mutex);
+    // TODO test
+    int j = 0;
+    for (int i = 0; i < *num_tasks; i++) {
+        if (task_arr[i] == t) {
+            assert(j == 0);
+            j = 1;
+        } else {
+            task_arr[i - j] = task_arr[i];
+        }
+    }
 
-    clock_gettime(CLOCK_REALTIME, &t->completion_time);
-    printf("Task %s is done\n", t->task_name);
+    if (j == 1)
+        (*num_tasks)--;
 
-    pthread_mutex_lock(&mlfq_active_mutex);
-    TAILQ_REMOVE(&mlfq->active, t, tailq);
-    pthread_mutex_unlock(&mlfq_active_mutex);
-
-    pthread_mutex_lock(&mlfq_done_mutex);
-    TAILQ_INSERT_TAIL(&mlfq->done, t, tailq);
-    pthread_mutex_unlock(&mlfq_done_mutex);
-
+    pthread_mutex_unlock(mutex);
 }
 
 /**
- * Returns and removes the next task to be scheduled by the MLFQ.
+ * Remove and return the task at the start of the array
  */
-task *mlfq_pop() {
-    task *t = mlfq_next();
-    if (t != NULL)
-        mlfq_remove(t);
+task *pop_task(task *task_arr[MAX_TASKS], int *num_tasks, pthread_mutex_t *mutex) {
+    pthread_mutex_lock(mutex);
+    if (*num_tasks == 0)
+        return NULL;
 
+    task *t = task_arr[0];
+    for (int i = 0; i < (*num_tasks) - 1; i++) {
+        assert(task_arr[i + 1] != NULL);
+        task_arr[i] = task_arr[i + 1];
+    }
+
+    (*num_tasks)--;
+
+    pthread_mutex_unlock(mutex);
     return t;
 }
 
-/**
- * Removes and returns the next task to execute in the scheduler.
- * The next task to execute in the scheduler is the first task
- * in the highest level queue in the MLFQ.
- */
-task *mlfq_next() {
-    pthread_mutex_lock(&mlfq_levels_mutex);
-    task *next_task = NULL;
-    for (int level = MLFQ_TOP_PRIORITY - 1; level >= 0; level--) {
-        if (!TAILQ_EMPTY(&mlfq->levels[level])) {
-            next_task = TAILQ_FIRST(&mlfq->levels[level]);
-            //assert(level == next_task->priority);
-            // assert(next_task->time_remaining > 0);
-            verify_task(next_task);
-            if (level != next_task->priority) {
-                printf("OOPS level %d, time %d\n\n", level, next_task->time_remaining);
-                print_task(next_task);
-            }
-            break;
-        }
-    }
-    pthread_mutex_unlock(&mlfq_levels_mutex);
-
-    return next_task;
+void append_task(task *task_arr[MAX_TASKS], task *t, int *num_tasks, pthread_mutex_t *mutex) {
+    pthread_mutex_lock(mutex);
+    task_arr[(*num_tasks)++] = t;
+    pthread_mutex_unlock(mutex);
 }
 
-/**
- * Removes a given task from the MLFQ.
- * Assumes that the task exists at the priority that its priority field describes.
- */
-void mlfq_remove(task *t) {
+task *mlfq_pop() {
+    for (int level = MLFQ_TOP_PRIORITY - 1; level >= 0; level--) {
+        if (mlfq->num_tasks[level] > 0) {
+            return pop_task(mlfq->levels[level], &mlfq->num_tasks[level], &mlfq_levels_mutex);
+        }
+    }
+
+    return NULL;
+}
+
+void mlfq_done(task *t) {
+    clock_gettime(CLOCK_REALTIME, &t->completion_time);
+    printf("Task %s is done\n", t->task_name);
+
+    remove_task(t, mlfq->active, &mlfq->num_active, &mlfq_active_mutex);
+    append_task(mlfq->done, t, &mlfq->num_done, &mlfq_done_mutex);
+}
+
+bool mlfq_is_empty() {
     pthread_mutex_lock(&mlfq_levels_mutex);
-    TAILQ_REMOVE(&mlfq->levels[t->priority], t, tailq);
+    for (int i = 0; i < MLFQ_TOP_PRIORITY; i++) {
+        if (mlfq->num_tasks[i] > 0) {
+            pthread_mutex_unlock(&mlfq_levels_mutex);
+            return false;
+        }
+    }
+
     pthread_mutex_unlock(&mlfq_levels_mutex);
+    return true;
 }
 
 /**
@@ -241,33 +253,35 @@ void mlfq_remove(task *t) {
  */
 bool mlfq_is_done() {
     bool done = true;
-    // Acquiring this lock means that there is no CPU trying to get a hold of a task
+    // If any of the MLFQ levels are non-empty, we're not done
+    if (!mlfq_is_empty()) {
+        done = false;
+    }
+
     pthread_mutex_lock(&available_task_mutex);
-
-    if (reading_done && available_task == NULL) {
-        // If any of the MLFQ levels are non-empty, we're not done
-        if (mlfq_next() != NULL) {
-            done = false;
-        }
-
-        // If any CPUs are currently working on a task, we're not done
-        pthread_mutex_lock(&active_task_mutex);
-        for (int i = 0; i < num_cpus; i++) {
-            if (active_task[i] != NULL) {
-                done = false;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&active_task_mutex);
-    } else {
-        // Since we aren't done reading, or there's still an available task, we know we're not done
+    // If we aren't done reading, or there's still an available task, we know we're not done
+    if (!reading_done || available_task != NULL) {
         done = false;
     }
 
     pthread_mutex_unlock(&available_task_mutex);
+
+    // If any CPUs are currently working on a task, we're not done
+    pthread_mutex_lock(&active_task_mutex);
+    if (mlfq->num_active > 0) {
+        done = false;
+    }
+
+    pthread_mutex_unlock(&active_task_mutex);
     return done;
 }
 
+void mlfq_change_priority(task *t, int new_priority) {
+    pthread_mutex_lock(&mlfq_levels_mutex);
+    append_task(mlfq->levels[new_priority], t, &mlfq->num_tasks[new_priority], &mlfq_levels_mutex);
+    t->priority = new_priority;
+    pthread_mutex_lock(&mlfq_levels_mutex);
+}
 
 /**
  * Reset the priority of all tasks in the MLFQ to be top priority.
@@ -279,31 +293,23 @@ void mlfq_reset_queues() {
 
     printf("Resetting all queues\n");
 
-    if (!TAILQ_EMPTY(&mlfq->active)) {
+    if (mlfq->num_active > 0) {
         // Reset the priority of all active tasks
-        task *t;
-        TAILQ_FOREACH(t, &mlfq->active, tailq) {
-            mlfq_insert_at(t, MLFQ_TOP_PRIORITY - 1);
+        for (int level = 0; level < MLFQ_TOP_PRIORITY - 1; level++) {
+            task *t;
+            while ((t = pop_task(mlfq->levels[level], &mlfq->num_tasks[level], &mlfq_levels_mutex)) != NULL) {
+                append_task(mlfq->levels[MLFQ_TOP_PRIORITY - 1], t, &mlfq->num_tasks[MLFQ_TOP_PRIORITY - 1],
+                            &mlfq_levels_mutex);
+                // TODO: How do to atomically: wait until this task is done running
+            }
         }
     }
 
     clock_gettime(CLOCK_REALTIME, &current_time);
     mlfq->last_reset_time = current_time;
 
-    pthread_mutex_unlock(&mlfq_levels_mutex);
     pthread_mutex_unlock(&mlfq_active_mutex);
-}
-
-/**
- * Remove the task from its original level, then insert it at its new level.
- */
-void mlfq_insert_at(task *t, int priority) {
-    assert(priority >= 0 && priority < MLFQ_TOP_PRIORITY);
-    verify_task(t);
-    printf("Task %s is changing priority to %d\n", t->task_name, priority);
-    mlfq_remove(t);
-    t->priority = priority;
-    mlfq_insert(t);
+    pthread_mutex_unlock(&mlfq_levels_mutex);
 }
 
 #define DELAY_TOKEN "DELAY"
@@ -345,6 +351,7 @@ void *reader(void *args) {
             new_task->priority = MLFQ_TOP_PRIORITY - 1;
             new_task->odds_of_io = odds_of_io;
             clock_gettime(CLOCK_REALTIME, &new_task->arrival_time);
+            verify_task(new_task);
             mlfq_introduce(new_task);
         }
     }
@@ -356,7 +363,7 @@ void *reader(void *args) {
 
 void *scheduler(void *args) {
     (void) args;
-    //struct timespec current_time;
+    struct timespec current_time;
 
     printf("SCHEDULER: starting\n");
     while (!mlfq_is_done()) {
@@ -367,15 +374,18 @@ void *scheduler(void *args) {
         }
 
         // Rule 5: After some time period S, move all the tasks in the system to the topmost queue
-        //clock_gettime(CLOCK_REALTIME, &current_time);
-        //if (timespec_to_usecs(current_time) - timespec_to_usecs(mlfq->last_reset_time) >= mlfq->s) {
-        //    mlfq_reset_queues();
-        //}
+        clock_gettime(CLOCK_REALTIME, &current_time);
+        if (timespec_to_usecs(current_time) - timespec_to_usecs(mlfq->last_reset_time) >= mlfq->s) {
+            mlfq_reset_queues();
+        }
 
         // Set the next available task to be executed
         available_task = mlfq_pop();
         if (available_task != NULL) {
+            verify_task(available_task);
             pthread_cond_signal(&available_task_cond);
+        } else {
+            printf("No tasks to schedule\n");
         }
 
         pthread_mutex_unlock(&available_task_mutex);
@@ -390,6 +400,7 @@ void *worker(void *args) {
 
     printf("WORKER: starting\n");
     while (!mlfq_is_done()) {
+        // Get a task to work on
         pthread_mutex_lock(&available_task_mutex);
         printf("WORKER: waiting for a task\n");
         while (available_task == NULL) {
@@ -412,7 +423,7 @@ void *worker(void *args) {
         print_task(active_task[0]);
 
         // Determine how much time this task is going to take
-        int sleep_time;
+        int sleep_time; // TODO: Race condition
         if (active_task[0]->task_type == io_task) { // TODO: Don't only do for IO tasks
             int rand_io = rand() % 100;
             if (active_task[0]->odds_of_io < rand_io) {
@@ -436,12 +447,8 @@ void *worker(void *args) {
         microsleep(sleep_time);
         printf("WORKER: Finished %s in %u\n", active_task[0]->task_name, sleep_time);
 
-
-        pthread_mutex_lock(&mlfq_levels_mutex);
-
         active_task[0]->time_remaining -= sleep_time;
         assert(active_task[0]->time_remaining >= 0);
-        printf("WORKER: Taking levels lock\n");
         // Drop priority if entire quantum is used
         if (sleep_time == QUANTUM_LEN && active_task[0]->priority > 0) { // TODO: Track total time, comp. TIME_ALLOTMENT
             active_task[0]->priority--;
@@ -449,16 +456,11 @@ void *worker(void *args) {
 
         if (active_task[0]->time_remaining > 0) {
             // We're not done the task, send it back to the scheduler
-            //mlfq_insert(active_task[0]);
-            TAILQ_INSERT_TAIL(&mlfq->levels[active_task[0]->priority], active_task[0], tailq);
+            mlfq_insert(active_task[0]);
+            verify_task(active_task[0]);
         } else if (active_task[0]->time_remaining == 0) {
             mlfq_done(active_task[0]);
         }
-
-        pthread_mutex_unlock(&mlfq_levels_mutex);
-
-        printf("WORKER: Released levels lock\n");
-
 
         active_task[0] = NULL;
 
@@ -482,18 +484,11 @@ void report_statistics() {
             average_response[NUM_TASK_TYPES] = {0};
     printf("%lu\n", average_turnaround[1]);
     int t = 1;
-    while (!TAILQ_EMPTY(&mlfq->done)) {
-        done_task = TAILQ_FIRST(&mlfq->done);
-        TAILQ_REMOVE(&mlfq->done, done_task, tailq);
+    while (mlfq->num_done > 0) {
+        done_task = pop_task(mlfq->done, &mlfq->num_done, &mlfq_done_mutex);
 
-        average_turnaround[done_task->task_type] +=
-                (timespec_to_usecs(turnaround_time(done_task)) -
-                 average_turnaround[done_task->task_type]) /
-                t;
-        average_response[done_task->task_type] +=
-                (timespec_to_usecs(response_time(done_task)) -
-                 average_response[done_task->task_type]) /
-                t;
+        average_turnaround[done_task->task_type] += (timespec_to_usecs(turnaround_time(done_task)) - average_turnaround[done_task->task_type]) / t;
+        average_response[done_task->task_type] += (timespec_to_usecs(response_time(done_task)) - average_response[done_task->task_type]) / t;
 
         ++t;
     }
