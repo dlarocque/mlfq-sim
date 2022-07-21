@@ -151,14 +151,9 @@ void mlfq_init(int s) {
  * and inserting it into the MLFQ.
  */
 void mlfq_introduce(task *t) {
-    verify_task(t);
-    printf("XXX: Locking mlfq_active_mutex\n");
-    fflush(stdout);
     pthread_mutex_lock(&mlfq_active_mutex);
     mlfq->active[mlfq->num_active++] = t;
     pthread_mutex_unlock(&mlfq_active_mutex);
-    printf("XXX: Unlocked mlfq_active_mutex\n");
-    fflush(stdout);
     printf("READER: Introduced task %s\n", t->task_name);
 
     mlfq_insert(t);
@@ -182,9 +177,6 @@ void remove_task(task *t, task *task_arr[MAX_TASKS], int *num_tasks, pthread_mut
     printf("XXX: Locking mutex in remove\n");
     fflush(stdout);
     pthread_mutex_lock(mutex);
-    printf("XXX: acquired lock in remove\n");
-    fflush(stdout);
-    // TODO test
     int j = 0;
     for (int i = 0; i < *num_tasks; i++) {
         if (task_arr[i] == t) {
@@ -496,8 +488,10 @@ void *worker(void *args) {
                 if (sleep_time > active_task[0]->time_remaining) {
                     sleep_time = active_task[0]->time_remaining;
                 }
-            } else {
+            } else if (active_task[0]->time_remaining > QUANTUM_LEN) {
                 sleep_time = QUANTUM_LEN;
+            } else {
+                sleep_time = active_task[0]->time_remaining;
             }
         } else {
             // Sleep until the task is done or time quantum is complete
@@ -507,6 +501,7 @@ void *worker(void *args) {
                 sleep_time = active_task[0]->time_remaining;
             }
         }
+        assert(active_task[0]->time_remaining >= sleep_time);
 
         // Sleep for alloted time
         microsleep(sleep_time);
